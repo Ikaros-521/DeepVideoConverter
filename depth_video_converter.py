@@ -764,23 +764,11 @@ class DepthVideoConverter:
                 logger.error(f"不支持的深度模式: {self.depth_mode}")
                 return np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
             
-            # 应用激进的时序稳定性算法
-            # 1. 深度值锁定（最强稳定性）
-            depth_map = self._apply_depth_locking_stability(image_rgb, depth_map)
+            # 应用轻量级的时序稳定性算法
+            # 只使用基本的时序平滑，避免过度处理
+            depth_map = self._apply_temporal_smoothing(depth_map, alpha=0.1)  # 轻微的平滑
             
-            # 2. 直方图匹配（保持深度分布一致性）
-            depth_map = self._apply_histogram_matching_stability(depth_map)
-            
-            # 3. 自适应时序平滑
-            depth_map = self._apply_temporal_smoothing(depth_map, alpha=0.2)  # 更强的平滑
-            
-            # 4. 颜色一致性平滑
-            depth_map = self._apply_color_consistent_depth(image_rgb, depth_map)
-            
-            # 5. 统计特性平滑
-            depth_map = self._apply_depth_statistics_smoothing(depth_map)
-            
-            # 保存当前图像用于下一帧的颜色一致性计算
+            # 保存当前图像用于下一帧的时序平滑
             self.previous_image = image_rgb.copy()
             
             return depth_map
