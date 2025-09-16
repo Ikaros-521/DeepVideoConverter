@@ -19,7 +19,7 @@ from images_to_video import ImageSequenceToVideo
 
 def process_image(input_image, model_name, device, output_format, black_threshold, 
                  depth_mode, dominant_weight, depth_range_min, depth_range_max, 
-                 similarity_threshold, custom_color_map):
+                 similarity_threshold, custom_color_map, temporal_stability, global_normalization):
     """处理图像"""
     try:
         # 保存上传的图像到临时文件
@@ -56,7 +56,9 @@ def process_image(input_image, model_name, device, output_format, black_threshol
             black_threshold=black_threshold,
             depth_mode=depth_mode,
             color_depth_config=color_depth_config,
-            custom_color_map=custom_map
+            custom_color_map=custom_map,
+            temporal_stability=temporal_stability,
+            global_normalization=global_normalization
         )
         
         # 处理图像
@@ -83,7 +85,8 @@ def process_image(input_image, model_name, device, output_format, black_threshol
 def process_video(input_video, model_name, device, output_format, black_threshold, 
                  start_frame, max_frames, fps, force_images, auto_convert, 
                  video_codec, video_quality, depth_mode, dominant_weight, 
-                 depth_range_min, depth_range_max, similarity_threshold, custom_color_map):
+                 depth_range_min, depth_range_max, similarity_threshold, custom_color_map,
+                 temporal_stability, global_normalization):
     """处理视频"""
     try:
         # 保存上传的视频到临时文件
@@ -122,7 +125,9 @@ def process_video(input_video, model_name, device, output_format, black_threshol
             black_threshold=black_threshold,
             depth_mode=depth_mode,
             color_depth_config=color_depth_config,
-            custom_color_map=custom_map
+            custom_color_map=custom_map,
+            temporal_stability=temporal_stability,
+            global_normalization=global_normalization
         )
         
         # 处理视频
@@ -420,6 +425,21 @@ def create_gradio_interface():
                             label="视频质量",
                             info="low: 快速 | medium: 平衡 | high: 高质量 | lossless: 无损"
                         )
+                
+                gr.HTML('<div class="section-title">🔧 时序稳定性设置</div>')
+                
+                with gr.Group():
+                    temporal_stability = gr.Checkbox(
+                        value=True, 
+                        label="启用时序稳定性", 
+                        info="减少相邻帧之间的深度值突变，提高视频稳定性"
+                    )
+                    
+                    global_normalization = gr.Checkbox(
+                        value=True, 
+                        label="使用全局深度归一化", 
+                        info="使用整个视频的深度范围进行归一化，确保颜色一致性"
+                    )
             
             # 中间：图像和视频处理 (40%)
             with gr.Column(scale=1.6):
@@ -493,12 +513,13 @@ def create_gradio_interface():
                     gr.HTML("""
                     <div style="margin-top: 10px; padding: 10px; background: #e8f4fd; border-radius: 6px;">
                         <h4 style="margin: 0 0 8px 0; color: #2c3e50;">💡 使用提示</h4>
-                        <ul style="margin: 0; padding-left: 20px; font-size: 13px;">
-                            <li>GPU加速处理速度更快</li>
-                            <li>depth_only格式处理最快</li>
-                            <li>强制图像序列可避免编码问题</li>
-                            <li>支持批量处理多个文件</li>
-                        </ul>
+                    <ul style="margin: 0; padding-left: 20px; font-size: 13px;">
+                        <li>GPU加速处理速度更快</li>
+                        <li>depth_only格式处理最快</li>
+                        <li>强制图像序列可避免编码问题</li>
+                        <li>支持批量处理多个文件</li>
+                        <li>时序稳定性减少颜色突变</li>
+                    </ul>
                     </div>
                     """)
         
@@ -514,7 +535,7 @@ def create_gradio_interface():
         # 事件处理
         def process_image_wrapper(input_image, model_name, device, output_format, black_threshold,
                                 depth_mode, dominant_weight, depth_range_min, depth_range_max,
-                                similarity_threshold, custom_color_map):
+                                similarity_threshold, custom_color_map, temporal_stability, global_normalization):
             if input_image is None:
                 return None, None, "请先上传图像"
             
@@ -522,7 +543,7 @@ def create_gradio_interface():
             result_image, output_path = process_image(
                 input_image, model_name, device, output_format, black_threshold,
                 depth_mode, dominant_weight, depth_range_min, depth_range_max,
-                similarity_threshold, custom_color_map
+                similarity_threshold, custom_color_map, temporal_stability, global_normalization
             )
             
             if result_image is not None:
@@ -536,7 +557,7 @@ def create_gradio_interface():
                                 black_threshold, start_frame, max_frames, fps,
                                 force_images, auto_convert, video_codec, video_quality,
                                 depth_mode, dominant_weight, depth_range_min, depth_range_max,
-                                similarity_threshold, custom_color_map):
+                                similarity_threshold, custom_color_map, temporal_stability, global_normalization):
             if input_video is None:
                 return None, None, "请先上传视频"
             
@@ -546,7 +567,7 @@ def create_gradio_interface():
                 black_threshold, start_frame, max_frames, fps,
                 force_images, auto_convert, video_codec, video_quality,
                 depth_mode, dominant_weight, depth_range_min, depth_range_max,
-                similarity_threshold, custom_color_map
+                similarity_threshold, custom_color_map, temporal_stability, global_normalization
             )
             
             if output_path is not None:
@@ -584,7 +605,7 @@ def create_gradio_interface():
             fn=process_image_wrapper,
             inputs=[image_input, model_name, device, output_format, black_threshold,
                    depth_mode, dominant_weight, depth_range_min, depth_range_max,
-                   similarity_threshold, custom_color_map],
+                   similarity_threshold, custom_color_map, temporal_stability, global_normalization],
             outputs=[image_output, image_download, status_text]
         )
         
@@ -593,7 +614,8 @@ def create_gradio_interface():
             inputs=[video_input, model_name, device, output_format, black_threshold, 
                    start_frame, max_frames, fps, force_images, auto_convert, 
                    video_codec, video_quality, depth_mode, dominant_weight, 
-                   depth_range_min, depth_range_max, similarity_threshold, custom_color_map],
+                   depth_range_min, depth_range_max, similarity_threshold, custom_color_map,
+                   temporal_stability, global_normalization],
             outputs=[video_output, video_download, status_text]
         )
         
@@ -632,6 +654,7 @@ def create_gradio_interface():
                         <li>✅ 在线视频预览</li>
                         <li>✅ 多种编码器支持</li>
                         <li>✅ 批量处理支持</li>
+                        <li>✅ 时序稳定性优化</li>
                     </ul>
                 </div>
             </div>

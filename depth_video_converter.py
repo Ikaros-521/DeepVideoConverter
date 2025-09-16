@@ -40,7 +40,9 @@ class DepthVideoConverter:
                  black_threshold: int = 30,
                  depth_mode: str = "ai",
                  color_depth_config: Optional[Dict] = None,
-                 custom_color_map: Optional[Dict] = None):
+                 custom_color_map: Optional[Dict] = None,
+                 temporal_stability: bool = True,
+                 global_normalization: bool = True):
         """
         初始化深度视频转换器
         
@@ -52,6 +54,8 @@ class DepthVideoConverter:
             depth_mode: 深度计算模式 ("ai", "color_based", "custom")
             color_depth_config: 颜色深度配置
             custom_color_map: 自定义颜色深度映射
+            temporal_stability: 是否启用时序稳定性
+            global_normalization: 是否使用全局深度归一化
         """
         self.model_name = model_name
         self.output_format = output_format
@@ -59,6 +63,20 @@ class DepthVideoConverter:
         self.depth_mode = depth_mode
         self.color_depth_config = color_depth_config or {}
         self.custom_color_map = custom_color_map or {}
+        self.temporal_stability = temporal_stability
+        self.global_normalization = global_normalization
+        
+        # 时序稳定性相关变量
+        self.previous_depth_map = None
+        self.global_depth_min = None
+        self.global_depth_max = None
+        self.depth_history = []  # 存储最近几帧的深度图用于平滑
+        self.previous_image = None  # 存储前一帧的图像用于颜色一致性
+        
+        # 深度值锁定机制
+        self.depth_locks = {}  # 存储已锁定的深度值
+        self.color_depth_mapping = {}  # 颜色到深度的映射
+        self.lock_threshold = 0.85  # 锁定阈值
         
         # 设置设备
         if device == "auto":
@@ -363,6 +381,292 @@ class DepthVideoConverter:
         
         return color_map.get(color_name.lower(), (128, 128, 128))
     
+    def _apply_temporal_smoothing(self, depth_map: np.ndarray, alpha: float = 0.3) -> np.ndarray:
+        """
+        应用时序平滑以减少深度值的突变
+        
+        Args:
+            depth_map: 当前帧的深度图
+            alpha: 平滑系数 (0-1)，越小越平滑
+            
+        Returns:
+            smoothed_depth_map: 平滑后的深度图
+        """
+        if not self.temporal_stability or self.previous_depth_map is None:
+            self.previous_depth_map = depth_map.copy()
+            return depth_map
+        
+        # 计算帧间差异
+        diff = np.abs(depth_map.astype(np.float32) - self.previous_depth_map.astype(np.float32))
+        
+        # 自适应平滑：差异大的区域使用更强的平滑
+        adaptive_alpha = np.where(diff > 30, alpha * 0.5, alpha)  # 差异大时平滑更强
+        
+        # 应用自适应平滑
+        smoothed = adaptive_alpha * self.previous_depth_map.astype(np.float32) + \
+                  (1 - adaptive_alpha) * depth_map.astype(np.float32)
+        
+        # 更新历史记录
+        self.previous_depth_map = smoothed.astype(np.uint8).copy()
+        
+        return smoothed.astype(np.uint8)
+    
+    def _apply_color_consistent_depth(self, image: np.ndarray, depth_map: np.ndarray) -> np.ndarray:
+        """
+        基于颜色一致性应用深度平滑
+        
+        Args:
+            image: 原始图像
+            depth_map: 当前深度图
+            
+        Returns:
+            consistent_depth_map: 颜色一致的深度图
+        """
+        if not self.temporal_stability or self.previous_depth_map is None:
+            return depth_map
+        
+        # 检测黑色背景
+        black_mask = (image[:, :, 0] < self.black_threshold) & \
+                    (image[:, :, 1] < self.black_threshold) & \
+                    (image[:, :, 2] < self.black_threshold)
+        
+        # 只对非黑色区域应用颜色一致性
+        non_black_mask = ~black_mask
+        
+        if not np.any(non_black_mask):
+            return depth_map
+        
+        # 计算颜色相似度
+        current_colors = image[non_black_mask]
+        if hasattr(self, 'previous_image') and self.previous_image is not None:
+            prev_colors = self.previous_image[non_black_mask]
+            
+            # 计算颜色差异
+            color_diff = np.sqrt(np.sum((current_colors.astype(np.float32) - 
+                                       prev_colors.astype(np.float32)) ** 2, axis=1))
+            
+            # 颜色相似的区域使用更强的时序平滑
+            color_similarity = np.exp(-color_diff / 50.0)  # 颜色相似度
+            
+            # 创建平滑权重
+            smooth_weight = np.zeros_like(depth_map, dtype=np.float32)
+            smooth_weight[non_black_mask] = color_similarity * 0.8  # 颜色相似时平滑更强
+            
+            # 应用颜色一致性平滑
+            consistent_depth = smooth_weight * self.previous_depth_map.astype(np.float32) + \
+                             (1 - smooth_weight) * depth_map.astype(np.float32)
+            
+            return consistent_depth.astype(np.uint8)
+        
+        return depth_map
+    
+    def _apply_depth_statistics_smoothing(self, depth_map: np.ndarray) -> np.ndarray:
+        """
+        基于深度统计特性的平滑算法
+        
+        Args:
+            depth_map: 当前深度图
+            
+        Returns:
+            smoothed_depth_map: 统计平滑后的深度图
+        """
+        if not self.temporal_stability or self.previous_depth_map is None:
+            return depth_map
+        
+        # 计算深度值的统计特性
+        current_mean = np.mean(depth_map[depth_map > 0])  # 排除黑色背景
+        current_std = np.std(depth_map[depth_map > 0])
+        
+        if hasattr(self, 'depth_stats_history'):
+            if len(self.depth_stats_history) > 0:
+                # 使用历史统计信息进行平滑
+                prev_mean = np.mean([stats['mean'] for stats in self.depth_stats_history[-3:]])  # 最近3帧的平均值
+                prev_std = np.mean([stats['std'] for stats in self.depth_stats_history[-3:]])
+                
+                # 如果统计特性变化太大，使用更强的平滑
+                mean_diff = abs(current_mean - prev_mean)
+                std_diff = abs(current_std - prev_std)
+                
+                if mean_diff > 20 or std_diff > 15:  # 统计特性变化较大
+                    # 使用历史统计信息调整深度图
+                    depth_map_adjusted = depth_map.astype(np.float32)
+                    depth_map_adjusted[depth_map > 0] = (depth_map_adjusted[depth_map > 0] - current_mean) * (prev_std / current_std) + prev_mean
+                    depth_map_adjusted = np.clip(depth_map_adjusted, 0, 255)
+                    
+                    # 与前一帧进行混合
+                    smoothed = 0.6 * self.previous_depth_map.astype(np.float32) + 0.4 * depth_map_adjusted
+                    depth_map = smoothed.astype(np.uint8)
+        
+        # 保存当前统计信息
+        if not hasattr(self, 'depth_stats_history'):
+            self.depth_stats_history = []
+        
+        self.depth_stats_history.append({
+            'mean': current_mean,
+            'std': current_std
+        })
+        
+        # 只保留最近10帧的统计信息
+        if len(self.depth_stats_history) > 10:
+            self.depth_stats_history = self.depth_stats_history[-10:]
+        
+        return depth_map
+    
+    def _apply_depth_locking_stability(self, image: np.ndarray, depth_map: np.ndarray) -> np.ndarray:
+        """
+        基于深度值锁定的激进稳定性算法
+        
+        Args:
+            image: 原始图像
+            depth_map: 当前深度图
+            
+        Returns:
+            locked_depth_map: 锁定后的深度图
+        """
+        if not self.temporal_stability:
+            return depth_map
+        
+        # 检测黑色背景
+        black_mask = (image[:, :, 0] < self.black_threshold) & \
+                    (image[:, :, 1] < self.black_threshold) & \
+                    (image[:, :, 2] < self.black_threshold)
+        
+        non_black_mask = ~black_mask
+        
+        if not np.any(non_black_mask):
+            return depth_map
+        
+        # 获取非黑色区域的像素
+        non_black_pixels = image[non_black_mask]
+        non_black_depths = depth_map[non_black_mask]
+        
+        # 创建锁定后的深度图
+        locked_depth_map = depth_map.copy()
+        
+        for i, (pixel, current_depth) in enumerate(zip(non_black_pixels, non_black_depths)):
+            pixel_tuple = tuple(pixel)
+            
+            # 检查是否已有该颜色的锁定深度
+            if pixel_tuple in self.color_depth_mapping:
+                locked_depth = self.color_depth_mapping[pixel_tuple]
+                
+                # 如果当前深度与锁定深度差异不大，使用锁定深度
+                if abs(current_depth - locked_depth) < 20:  # 差异阈值
+                    locked_depth_map[non_black_mask][i] = locked_depth
+                else:
+                    # 差异较大时，更新锁定深度（缓慢更新）
+                    new_locked_depth = int(0.7 * locked_depth + 0.3 * current_depth)
+                    self.color_depth_mapping[pixel_tuple] = new_locked_depth
+                    locked_depth_map[non_black_mask][i] = new_locked_depth
+            else:
+                # 新颜色，直接锁定当前深度
+                self.color_depth_mapping[pixel_tuple] = current_depth
+        
+        return locked_depth_map
+    
+    def _apply_histogram_matching_stability(self, depth_map: np.ndarray) -> np.ndarray:
+        """
+        基于直方图匹配的稳定性算法
+        
+        Args:
+            depth_map: 当前深度图
+            
+        Returns:
+            matched_depth_map: 直方图匹配后的深度图
+        """
+        if not self.temporal_stability or self.previous_depth_map is None:
+            return depth_map
+        
+        # 计算当前帧和前一帧的深度直方图
+        current_hist = np.histogram(depth_map[depth_map > 0], bins=256, range=(0, 256))[0]
+        prev_hist = np.histogram(self.previous_depth_map[self.previous_depth_map > 0], bins=256, range=(0, 256))[0]
+        
+        # 计算累积分布函数
+        current_cdf = np.cumsum(current_hist).astype(np.float32)
+        prev_cdf = np.cumsum(prev_hist).astype(np.float32)
+        
+        # 归一化CDF
+        current_cdf = current_cdf / current_cdf[-1] if current_cdf[-1] > 0 else current_cdf
+        prev_cdf = prev_cdf / prev_cdf[-1] if prev_cdf[-1] > 0 else prev_cdf
+        
+        # 创建映射表
+        mapping = np.zeros(256, dtype=np.uint8)
+        for i in range(256):
+            # 找到最接近的CDF值
+            diff = np.abs(current_cdf[i] - prev_cdf)
+            closest_idx = np.argmin(diff)
+            mapping[i] = closest_idx
+        
+        # 应用映射
+        matched_depth_map = mapping[depth_map]
+        
+        return matched_depth_map
+    
+    def _normalize_depth_globally(self, depth_map: np.ndarray, is_first_frame: bool = False) -> np.ndarray:
+        """
+        使用全局深度范围进行归一化
+        
+        Args:
+            depth_map: 原始深度图
+            is_first_frame: 是否为第一帧
+            
+        Returns:
+            normalized_depth_map: 归一化后的深度图
+        """
+        if not self.global_normalization:
+            # 使用局部归一化
+            if depth_map.max() > depth_map.min():
+                normalized = ((depth_map - depth_map.min()) / 
+                            (depth_map.max() - depth_map.min()) * 255).astype(np.uint8)
+            else:
+                normalized = depth_map.copy()
+            return normalized
+        
+        # 更新全局深度范围
+        current_min = depth_map.min()
+        current_max = depth_map.max()
+        
+        if is_first_frame or self.global_depth_min is None:
+            self.global_depth_min = current_min
+            self.global_depth_max = current_max
+            # 使用固定的深度范围，避免后续帧的范围变化
+            self.fixed_depth_range = (current_min, current_max)
+        else:
+            # 使用固定的深度范围进行归一化，不再更新范围
+            # 这样可以确保所有帧使用相同的深度范围
+            if hasattr(self, 'fixed_depth_range'):
+                self.global_depth_min, self.global_depth_max = self.fixed_depth_range
+            else:
+                # 如果没有固定范围，使用保守的更新策略
+                self.global_depth_min = min(self.global_depth_min, current_min)
+                self.global_depth_max = max(self.global_depth_max, current_max)
+                
+                # 添加一些缓冲，避免边界值被过度压缩
+                range_buffer = (self.global_depth_max - self.global_depth_min) * 0.05
+                self.global_depth_min = max(0, self.global_depth_min - range_buffer)
+                self.global_depth_max = min(255, self.global_depth_max + range_buffer)
+        
+        # 使用全局范围归一化
+        if self.global_depth_max > self.global_depth_min:
+            normalized = ((depth_map - self.global_depth_min) / 
+                        (self.global_depth_max - self.global_depth_min) * 255).astype(np.uint8)
+        else:
+            normalized = depth_map.copy()
+        
+        return normalized
+    
+    def reset_temporal_state(self):
+        """重置时序状态，用于新视频处理"""
+        self.previous_depth_map = None
+        self.global_depth_min = None
+        self.global_depth_max = None
+        self.depth_history = []
+        self.previous_image = None
+        self.depth_locks = {}
+        self.color_depth_mapping = {}
+        if hasattr(self, 'depth_stats_history'):
+            self.depth_stats_history = []
+    
     def _convert_images_to_video(self, images_dir: str, output_path: str, fps: float = 30.0) -> bool:
         """使用FFmpeg将图像序列转换为视频"""
         if not self.ffmpeg_available:
@@ -408,12 +712,13 @@ class DepthVideoConverter:
             logger.error(f"FFmpeg转换异常: {e}")
             return False
     
-    def estimate_depth(self, image: np.ndarray) -> np.ndarray:
+    def estimate_depth(self, image: np.ndarray, is_first_frame: bool = False) -> np.ndarray:
         """
         估计单张图像的深度
         
         Args:
             image: 输入图像 (H, W, 3)
+            is_first_frame: 是否为第一帧（用于全局归一化）
             
         Returns:
             depth_map: 深度图 (H, W)
@@ -440,9 +745,8 @@ class DepthVideoConverter:
                 result = self.depth_estimator(pil_image)
                 depth_map = np.array(result["depth"])
                 
-                # 归一化深度图到0-255
-                depth_map = ((depth_map - depth_map.min()) / 
-                            (depth_map.max() - depth_map.min()) * 255).astype(np.uint8)
+                # 使用全局归一化而不是局部归一化
+                depth_map = self._normalize_depth_globally(depth_map, is_first_frame)
                 
                 # 将黑色背景区域设为0（黑色）
                 depth_map[black_mask] = 0
@@ -459,6 +763,25 @@ class DepthVideoConverter:
             else:
                 logger.error(f"不支持的深度模式: {self.depth_mode}")
                 return np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
+            
+            # 应用激进的时序稳定性算法
+            # 1. 深度值锁定（最强稳定性）
+            depth_map = self._apply_depth_locking_stability(image_rgb, depth_map)
+            
+            # 2. 直方图匹配（保持深度分布一致性）
+            depth_map = self._apply_histogram_matching_stability(depth_map)
+            
+            # 3. 自适应时序平滑
+            depth_map = self._apply_temporal_smoothing(depth_map, alpha=0.2)  # 更强的平滑
+            
+            # 4. 颜色一致性平滑
+            depth_map = self._apply_color_consistent_depth(image_rgb, depth_map)
+            
+            # 5. 统计特性平滑
+            depth_map = self._apply_depth_statistics_smoothing(depth_map)
+            
+            # 保存当前图像用于下一帧的颜色一致性计算
+            self.previous_image = image_rgb.copy()
             
             return depth_map
             
@@ -512,6 +835,9 @@ class DepthVideoConverter:
                 logger.warning(f"检测到无效帧率，使用默认值30fps")
             
             logger.info(f"视频信息: {width}x{height}, {total_frames}帧, {original_fps:.2f}fps")
+            
+            # 重置时序状态
+            self.reset_temporal_state()
             
             # 设置起始帧
             cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
@@ -616,8 +942,9 @@ class DepthVideoConverter:
                     if not ret:
                         break
                     
-                    # 估计深度
-                    depth_map = self.estimate_depth(frame)
+                    # 估计深度，第一帧用于初始化全局深度范围
+                    is_first_frame = (processed_frames == 0)
+                    depth_map = self.estimate_depth(frame, is_first_frame)
                     
                     # 根据输出格式组合图像
                     output_frame = self._combine_frames(frame, depth_map)
@@ -709,7 +1036,7 @@ class DepthVideoConverter:
                 return False
             
             # 估计深度
-            depth_map = self.estimate_depth(image)
+            depth_map = self.estimate_depth(image, is_first_frame=True)
             
             # 根据输出格式组合图像
             output_image = self._combine_frames(image, depth_map)
@@ -822,8 +1149,9 @@ class DepthVideoConverter:
                         if not ret:
                             break
                         
-                        # 估计深度
-                        depth_map = self.estimate_depth(frame)
+                        # 估计深度，第一帧用于初始化全局深度范围
+                        is_first_frame = (processed_frames == 0)
+                        depth_map = self.estimate_depth(frame, is_first_frame)
                         
                         # 根据输出格式组合图像
                         output_frame = self._combine_frames(frame, depth_map)
@@ -952,8 +1280,9 @@ class DepthVideoConverter:
                         logger.warning(f"无法读取第 {processed_frames} 帧，可能已到达视频末尾")
                         break
                     
-                    # 估计深度
-                    depth_map = self.estimate_depth(frame)
+                    # 估计深度，第一帧用于初始化全局深度范围
+                    is_first_frame = (processed_frames == 0)
+                    depth_map = self.estimate_depth(frame, is_first_frame)
                     
                     # 根据输出格式组合图像
                     output_frame = self._combine_frames(frame, depth_map)
@@ -1028,6 +1357,14 @@ def main():
                        help="深度范围，格式: min,max (默认: 50,200)")
     parser.add_argument("--similarity-threshold", type=int, default=30,
                        help="颜色相似度阈值 (默认: 30)")
+    parser.add_argument("--temporal-stability", action="store_true", default=True,
+                       help="启用时序稳定性 (默认: 启用)")
+    parser.add_argument("--no-temporal-stability", action="store_true",
+                       help="禁用时序稳定性")
+    parser.add_argument("--global-normalization", action="store_true", default=True,
+                       help="使用全局深度归一化 (默认: 启用)")
+    parser.add_argument("--no-global-normalization", action="store_true",
+                       help="禁用全局深度归一化")
     
     args = parser.parse_args()
     
@@ -1080,6 +1417,10 @@ def main():
         except Exception as e:
             logger.error(f"加载自定义颜色映射文件失败: {e}")
     
+    # 处理时序稳定性和全局归一化参数
+    temporal_stability = args.temporal_stability and not args.no_temporal_stability
+    global_normalization = args.global_normalization and not args.no_global_normalization
+    
     # 初始化转换器
     converter = DepthVideoConverter(
         model_name=args.model,
@@ -1088,7 +1429,9 @@ def main():
         black_threshold=args.black_threshold,
         depth_mode=args.depth_mode,
         color_depth_config=color_depth_config,
-        custom_color_map=custom_color_map
+        custom_color_map=custom_color_map,
+        temporal_stability=temporal_stability,
+        global_normalization=global_normalization
     )
     
     # 判断输入类型
